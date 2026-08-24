@@ -24,43 +24,52 @@ local DIAGNOSTIC_HISTORY_LIMIT = 10
 local MIN_SCORING_OBSERVED = 5
 local MIN_SCORING_PARTICIPATION = 0.05
 local URGENT_RECOVERY_THRESHOLD = 0.65
--- A heal that lands on someone at or below this fraction of maximum health is
--- treated as a clutch heal: without it the target was on a credible path to
--- dying. The deeper the target had fallen and the larger the heal relative to
--- their health pool, the more credit the healer receives.
-local CLUTCH_HEALTH_THRESHOLD = 0.35
-local LIFESAVE_HEALTH_THRESHOLD = 0.20
-local CLUTCH_MIN_HEAL_FRACTION = 0.04
-local LIFESAVE_MIN_HEAL_FRACTION = 0.10
-local CLUTCH_FULL_CREDIT_FRACTION = 0.25
-local CLUTCH_DAMAGE_ROLE_MAX_BONUS = 4
-local CLUTCH_SUPPORT_MAX_BONUS = 6
-local CLUTCH_CREDIT_PER_MINUTE_SCALE = 2.50
--- A healer who also contributes damage is rewarded, but only once their actual
--- healing duties are demonstrably met. The gate is zero if anyone died a
--- preventable death, so damage can never be traded against healing.
-local HEALER_DAMAGE_MAX_BONUS = 6
-local HEALER_DAMAGE_GATE_FLOOR = 0.90
-local HEALER_DAMAGE_GATE_SPAN = 0.20
--- Mitigation is measured from what the combat log actually proves: the
--- resisted, blocked and absorbed portions of every hit the tank took, plus the
--- swings they avoided outright. No spell list is required, so this works on a
--- custom client whose defensive abilities are unknown to the addon.
-local TANK_PRESSURE_WINDOW = 2
-local TANK_PRESSURE_HEALTH_FRACTION = 0.15
-local TANK_PAR_MITIGATION_RATE = 0.25
-local TANK_PAR_AVOIDANCE_RATE = 0.30
-local TANK_PAR_SELF_SUSTAIN_RATE = 0.15
-local TANK_SPIKE_RESPONSE_SCALE = 2.50
--- Pace. A dungeon is cleared in wall-clock time, not in combat time, so the
--- gaps between pulls matter as much as the pulls. Anything longer than this is
--- treated as real downtime rather than the normal seconds between packs.
-local PACE_DOWNTIME_FLOOR = 5
--- A spell that lands on the same non-tank three or more times in one fight is
--- the clearest signal the client can give that the damage was avoidable and
--- the player did not move. Everything past the second hit is counted.
-local REPEAT_HIT_FREE_HITS = 2
-local REPEAT_HIT_MAX_TRACKED_SPELLS = 48
+-- Scoring tuning. Grouped into one table rather than kept as many file
+-- level locals: Lua 5.1 refuses to compile a chunk with more than 200
+-- active locals, and this file is the largest in the addon.
+local TUNING = {}
+TUNING.CLUTCH_HEALTH_THRESHOLD = 0.35
+TUNING.LIFESAVE_HEALTH_THRESHOLD = 0.20
+TUNING.CLUTCH_MIN_HEAL_FRACTION = 0.04
+TUNING.LIFESAVE_MIN_HEAL_FRACTION = 0.10
+TUNING.CLUTCH_FULL_CREDIT_FRACTION = 0.25
+TUNING.CLUTCH_DAMAGE_ROLE_MAX_BONUS = 4
+TUNING.CLUTCH_SUPPORT_MAX_BONUS = 6
+TUNING.CLUTCH_CREDIT_PER_MINUTE_SCALE = 2.50
+TUNING.HEALER_DAMAGE_MAX_BONUS = 6
+TUNING.HEALER_DAMAGE_GATE_FLOOR = 0.90
+TUNING.HEALER_DAMAGE_GATE_SPAN = 0.20
+TUNING.TANK_PRESSURE_WINDOW = 2
+TUNING.TANK_PRESSURE_HEALTH_FRACTION = 0.15
+TUNING.TANK_PAR_MITIGATION_RATE = 0.25
+TUNING.TANK_PAR_AVOIDANCE_RATE = 0.30
+TUNING.TANK_PAR_SELF_SUSTAIN_RATE = 0.15
+TUNING.TANK_SPIKE_RESPONSE_SCALE = 2.50
+TUNING.PACE_DOWNTIME_FLOOR = 5
+TUNING.REPEAT_HIT_FREE_HITS = 2
+TUNING.REPEAT_HIT_MAX_TRACKED_SPELLS = 48
+TUNING.OBJECT_TYPE_PET_MASK = 0x00003000        -- PET + GUARDIAN
+TUNING.OBJECT_AFFILIATION_GROUP = 0x00000007    -- MINE + PARTY + RAID
+TUNING.DIAGNOSTIC_UNATTRIBUTED_LIMIT = 24
+TUNING.HYBRID_PAR_COMBINED = 0.85
+TUNING.HYBRID_HEAL_CREDIT_CAP = 0.60
+TUNING.HYBRID_SYNERGY_MIN_DAMAGE = 1.00
+TUNING.HYBRID_SYNERGY_MIN_HEAL = 0.15
+TUNING.HYBRID_SYNERGY_BONUS = 8
+TUNING.HYBRID_FULL_HEALER_THRESHOLD = 0.70
+TUNING.HYBRID_HEALER_MODE_PAR = 1.00
+TUNING.HYBRID_HEALER_MODE_DAMAGE_WEIGHT = 0.50
+TUNING.HYBRID_MIN_HEALER_DAMAGE_MULTIPLE = 2.00
+TUNING.HYBRID_DPS_GATE_FLOOR = 0.55
+TUNING.WIPE_PERIL_CRITICAL_PCT = 0.35
+TUNING.WIPE_PERIL_MIN_LOW_FRACTION = 0.50
+TUNING.WIPE_SAVE_CREDIT_MULTIPLIER = 2.50
+TUNING.PARTY_WIDE_HEAL_WINDOW = 10
+TUNING.PARTY_WIDE_MIN_FRACTION = 0.50
+TUNING.WIPE_SAVE_KEY_ROLES = { TANK = true, HEALER = true }
+-- A non-healer covering most of the party inside one window is carrying the
+-- group's healing, which is wipe prevention by any practical definition.
+
 local DIAGNOSTIC_FILE_PATH = "WTF\\Account\\<account>\\SavedVariables\\CoAAnalytics.lua"
 -- Level is only one indicator of power: gear and build still matter. This
 -- deliberately cautious curve corrects the most obvious gap without erasing
@@ -453,6 +462,10 @@ local function NewStats(member)
 		lifeSaves = 0,
 		clutchHealsOnTank = 0,
 		clutchHealsOnHealer = 0,
+		wipeSaves = 0,
+		wipeSaveCredit = 0,
+		partyWideSaves = 0,
+		partyWideBestCount = 0,
 		clutchSelfHeals = 0,
 		clutchRescuedBy = 0,
 		combatObservedSeconds = 0,
@@ -669,7 +682,33 @@ local function RefreshRoster()
 	end
 end
 
-local function GetOwnerGUID(guid)
+local function BandTest(value, mask)
+	value = tonumber(value)
+	if not value or value <= 0 then
+		return false
+	end
+	if type(bit) == "table" and type(bit.band) == "function" then
+		return bit.band(value, mask) ~= 0
+	end
+	-- Lua fallback for environments without the bit library.
+	local v, m, bitValue = value, mask, 1
+	while v > 0 and m > 0 do
+		if (v % 2 >= 1) and (m % 2 >= 1) then
+			return true
+		end
+		v = math.floor(v / 2)
+		m = math.floor(m / 2)
+		bitValue = bitValue * 2
+	end
+	return false
+end
+
+local function IsGroupPetFlags(flags)
+	return BandTest(flags, TUNING.OBJECT_TYPE_PET_MASK)
+		and BandTest(flags, TUNING.OBJECT_AFFILIATION_GROUP)
+end
+
+local function GetOwnerGUID(guid, flags, name)
 	if not session or not guid then
 		return
 	end
@@ -677,7 +716,31 @@ local function GetOwnerGUID(guid)
 	if member and (member.present or IsValidRosterUnit(guid, member)) then
 		return guid
 	end
-	return session.petOwners[guid]
+	local owner = session.petOwners[guid]
+	if owner then
+		return owner
+	end
+	-- The flags prove this is one of the group's pets. A guardian recast gets a
+	-- fresh GUID every time, so ownership learned by name from any previous
+	-- SPELL_SUMMON recovers it even if one summon event was missed.
+	if name and IsGroupPetFlags(flags) then
+		local byName = session.petNameOwners and session.petNameOwners[name]
+		if byName and session.roster[byName] then
+			session.petOwners[guid] = byName
+			session.summonedPets = session.summonedPets or {}
+			session.summonedPets[guid] = true
+			return byName
+		end
+		-- Still unattributed, but now provably a group pet rather than an
+		-- enemy. Recorded so the diagnostic can quantify what is being lost.
+		local unattributed = session.unattributedPets
+		if unattributed and not unattributed[name] then
+			unattributed.count = SafeNumber(unattributed.count) + 1
+			if unattributed.count <= TUNING.DIAGNOSTIC_UNATTRIBUTED_LIMIT then
+				unattributed[name] = 0
+			end
+		end
+	end
 end
 
 local function ForSamples(callback)
@@ -815,7 +878,7 @@ local function StartCombat()
 	local resumedAt = GetTime()
 	if session.combatEndedAt then
 		local gap = math.max(0, resumedAt - session.combatEndedAt)
-		if gap >= PACE_DOWNTIME_FLOOR then
+		if gap >= TUNING.PACE_DOWNTIME_FLOOR then
 			ForSamples(function(sample)
 				sample.downtimeSeconds = SafeNumber(sample.downtimeSeconds) + gap
 				sample.longestDowntime = math.max(
@@ -1137,7 +1200,7 @@ local function GetClutchBonus(participant, activeTime, maximumBonus)
 		/ math.max(activeTime / 60, 1)
 	return math.min(
 		maximumBonus,
-		creditPerMinute * CLUTCH_CREDIT_PER_MINUTE_SCALE
+		creditPerMinute * TUNING.CLUTCH_CREDIT_PER_MINUTE_SCALE
 	), creditPerMinute
 end
 
@@ -1154,7 +1217,7 @@ local function FinalizeDpsScore(outputScore, participant, activeTime)
 	local clutchBonus = GetClutchBonus(
 		participant,
 		activeTime,
-		CLUTCH_DAMAGE_ROLE_MAX_BONUS
+		TUNING.CLUTCH_DAMAGE_ROLE_MAX_BONUS
 	)
 	return Clamp(
 		outputScore * participationFactor * survivalFactor
@@ -1583,7 +1646,7 @@ local function CalculateHealerOutcome(
 		+ 0.25 * context.responsiveness
 	local damageGate = SafeNumber(stats.preventableDeaths) > 0 and 0
 		or Clamp(
-			(dutyScore - HEALER_DAMAGE_GATE_FLOOR) / HEALER_DAMAGE_GATE_SPAN,
+			(dutyScore - TUNING.HEALER_DAMAGE_GATE_FLOOR) / TUNING.HEALER_DAMAGE_GATE_SPAN,
 			0,
 			1
 		)
@@ -1592,12 +1655,12 @@ local function CalculateHealerOutcome(
 	local damageReference = SafeNumber(context.damageReference)
 	local damageRatio = damageReference > 0
 		and Clamp(damageRate / damageReference, 0, 1) or 0
-	local healerDamageBonus = HEALER_DAMAGE_MAX_BONUS * damageGate * damageRatio
+	local healerDamageBonus = TUNING.HEALER_DAMAGE_MAX_BONUS * damageGate * damageRatio
 	local healerClutchBonus = math.min(
-		CLUTCH_SUPPORT_MAX_BONUS,
+		TUNING.CLUTCH_SUPPORT_MAX_BONUS,
 		SafeNumber(stats.clutchCredit)
 			/ math.max(SafeNumber(context.activeTime) / 60, 1)
-			* CLUTCH_CREDIT_PER_MINUTE_SCALE
+			* TUNING.CLUTCH_CREDIT_PER_MINUTE_SCALE
 	)
 	local rawScore
 	if healerCount <= 1 then
@@ -1867,14 +1930,14 @@ local function GetTankMitigationProfile(stats, memberHealth)
 	-- Positive when mitigation is concentrated in the dangerous windows, which
 	-- is exactly the behaviour worth rewarding.
 	local spikeResponse = Clamp(
-		0.50 + (pressureMitigationRate - mitigationRate) * TANK_SPIKE_RESPONSE_SCALE,
+		0.50 + (pressureMitigationRate - mitigationRate) * TUNING.TANK_SPIKE_RESPONSE_SCALE,
 		0,
 		1.25
 	)
 	local quality = Clamp(
-		0.40 * Clamp(mitigationRate / TANK_PAR_MITIGATION_RATE, 0, 1.25)
-			+ 0.25 * Clamp(avoidanceRate / TANK_PAR_AVOIDANCE_RATE, 0, 1.25)
-			+ 0.20 * Clamp(selfSustainRate / TANK_PAR_SELF_SUSTAIN_RATE, 0, 1.25)
+		0.40 * Clamp(mitigationRate / TUNING.TANK_PAR_MITIGATION_RATE, 0, 1.25)
+			+ 0.25 * Clamp(avoidanceRate / TUNING.TANK_PAR_AVOIDANCE_RATE, 0, 1.25)
+			+ 0.20 * Clamp(selfSustainRate / TUNING.TANK_PAR_SELF_SUSTAIN_RATE, 0, 1.25)
 			+ 0.15 * spikeResponse,
 		0.40,
 		1.30
@@ -2006,6 +2069,126 @@ local function AddTankRanking(root, scope, sample, participants)
 	return true
 end
 
+-- Robust reference rates for the two pure roles in this fight, used to grade
+-- hybrids against what a dedicated player of each role actually produced.
+local function GetRoleReferenceRates(participants, activeTime)
+	local damageRates, healRates, healerDamageRates = {}, {}, {}
+	local seconds = math.max(1, SafeNumber(activeTime))
+	for _, participant in ipairs(participants or {}) do
+		local stats = participant.stats or {}
+		if IsDamageRole(participant.role) then
+			local rate = SafeNumber(stats.damage) / seconds
+			if rate > 0 then
+				damageRates[#damageRates + 1] = { rate = rate }
+			end
+		elseif participant.role == "HEALER" then
+			local rate = (SafeNumber(stats.effectiveHealing)
+				+ SafeNumber(stats.absorbs)) / seconds
+			if rate > 0 then
+				healRates[#healRates + 1] = { rate = rate }
+			end
+			local damageRate = SafeNumber(stats.damage) / seconds
+			if damageRate > 0 then
+				healerDamageRates[#healerDamageRates + 1] = { rate = damageRate }
+			end
+		end
+	end
+	return GetRobustMean(damageRates, "rate"),
+		GetRobustMean(healRates, "rate"),
+		GetRobustMean(healerDamageRates, "rate"),
+		#healRates > 0
+end
+
+-- A hybrid is graded on the sum of what it contributed to each pure role,
+-- each measured against that role's own reference. Healing credit is capped:
+-- a hybrid cannot stand in for a healer, so piling on healing can never carry
+-- the score on its own. Doing a full damage dealer's work while still healing
+-- meaningfully is the behaviour worth paying for, so it earns a synergy bonus.
+local function GetHybridContribution(
+	stats, activeTime, damageReference, healReference, healerDamageReference,
+	healerPresent, healLoadRate
+)
+	local seconds = math.max(1, SafeNumber(activeTime))
+	local damageRate = SafeNumber(stats.damage) / seconds
+	local healRate = (SafeNumber(stats.effectiveHealing)
+		+ SafeNumber(stats.absorbs)) / seconds
+	local damageShare = damageReference > 0
+		and Clamp(damageRate / damageReference, 0, 1.60) or 0
+	local rawHealShare = healReference > 0
+		and Clamp(healRate / healReference, 0, 1.60) or 0
+	-- Mode is decided by group composition, because that is what actually sets
+	-- the expectation. With a real healer in the group the hybrid is the
+	-- secondary and is expected to deal damage. With no healer at all the
+	-- hybrid *is* the healer, its damage is expected to be far lower, and
+	-- punishing it for that would be backwards. Output share is only a
+	-- fallback for the rare case of a hybrid genuinely out-healing the healer.
+	local soloHealer = (not healerPresent) and healRate > 0
+	local healerMode = soloHealer
+		or rawHealShare >= TUNING.HYBRID_FULL_HEALER_THRESHOLD
+	-- With no dedicated healer there is no healer output to measure against,
+	-- so the yardstick becomes the healing the fight actually demanded.
+	if soloHealer and healReference <= 0 then
+		healReference = SafeNumber(healLoadRate)
+		rawHealShare = healReference > 0
+			and Clamp(healRate / healReference, 0, 1.60) or 1
+	end
+	local healShare, combined, par
+	if healerMode then
+		healShare = rawHealShare
+		combined = healShare + damageShare * TUNING.HYBRID_HEALER_MODE_DAMAGE_WEIGHT
+		par = TUNING.HYBRID_HEALER_MODE_PAR
+	else
+		healShare = math.min(rawHealShare, TUNING.HYBRID_HEAL_CREDIT_CAP)
+		combined = damageShare + healShare
+		par = TUNING.HYBRID_PAR_COMBINED
+	end
+	local synergy = (damageShare >= TUNING.HYBRID_SYNERGY_MIN_DAMAGE
+		and rawHealShare >= TUNING.HYBRID_SYNERGY_MIN_HEAL) and TUNING.HYBRID_SYNERGY_BONUS or 0
+	-- The hybrid is meant to be a damage dealer that heals, not a second
+	-- healer. Sitting at healer-level damage scales the whole score down.
+	healerDamageReference = SafeNumber(healerDamageReference)
+	local healerDamageMultiple = healerDamageReference > 0
+		and damageRate / healerDamageReference or nil
+	-- The gate fades out as healing rises rather than switching off at a
+	-- threshold. A hybrid healing two thirds of a real healer's output is
+	-- obviously not dodging its damage role, and should not fall off a cliff
+	-- just for sitting one point below the healer-mode line.
+	local dpsGate = 1
+	if not healerMode and healerDamageMultiple then
+		local rawGate = Clamp(
+			healerDamageMultiple / TUNING.HYBRID_MIN_HEALER_DAMAGE_MULTIPLE,
+			TUNING.HYBRID_DPS_GATE_FLOOR,
+			1
+		)
+		local gateInfluence = 1 - Clamp(
+			rawHealShare / TUNING.HYBRID_FULL_HEALER_THRESHOLD, 0, 1
+		)
+		dpsGate = 1 - (1 - rawGate) * gateInfluence
+	end
+	return {
+		healerDamageReference = healerDamageReference,
+		healerDamageMultiple = healerDamageMultiple,
+		dpsGate = dpsGate,
+		damageRate = damageRate,
+		healRate = healRate,
+		damageReference = damageReference,
+		healReference = healReference,
+		damageShare = damageShare,
+		healShare = healShare,
+		rawHealShare = rawHealShare,
+		combined = combined,
+		par = par,
+		healerMode = healerMode,
+		soloHealer = soloHealer,
+		healerPresent = healerPresent and true or false,
+		mode = soloHealer and "solo healer"
+			or healerMode and "healer" or "damage",
+		synergy = synergy,
+		score = Clamp((100 * combined / par) * dpsGate + synergy, 30, 200),
+		measurable = (damageReference > 0 or healReference > 0),
+	}
+end
+
 local function AddSupportRanking(root, scope, sample, participants)
 	local category = EnsureCategory(root, scope, "support")
 	local supports = {}
@@ -2027,17 +2210,29 @@ local function AddSupportRanking(root, scope, sample, participants)
 		sample,
 		"supports=" .. GetEffectiveRoleCount(supports, activeTime)
 	)
+	local hybridDamageReference, hybridHealReference,
+		hybridHealerDamageReference, hybridHealerPresent =
+		GetRoleReferenceRates(participants, activeTime)
+	local hybridHealLoadRate =
+		SafeNumber(sample.groupDamageTaken) / math.max(1, activeTime)
 	for _, participant in ipairs(supports) do
 		local stats = participant.stats
 		local participation, aliveRate = GetCombatParticipation(participant, activeTime)
 		local contribution = SafeNumber(stats.damage)
 			+ SafeNumber(stats.effectiveHealing) + SafeNumber(stats.absorbs)
+		local hybrid = GetHybridContribution(
+			stats, activeTime, hybridDamageReference, hybridHealReference,
+			hybridHealerDamageReference, hybridHealerPresent, hybridHealLoadRate
+		)
 		local entry = EnsureEntry(category, participant.data)
 		AddContextMetrics(category, entry, contextKey, {
 			contributionRate = contribution / activeTime / participation,
 			utilityRate = SafeNumber(stats.utilityActions) / math.max(activeTime / 60, 1),
 			clutchRate = SafeNumber(stats.clutchCredit)
 				/ math.max(activeTime / 60, 1),
+			hybridScore = hybrid.measurable and hybrid.score or 100,
+			hybridDamageShare = hybrid.damageShare,
+			hybridHealShare = hybrid.healShare,
 			availability = aliveRate,
 		}, math.max(0.10, GetRawCombatParticipation(participant, activeTime)))
 	end
@@ -2231,6 +2426,8 @@ local function EnterInstance(context)
 		roster = {},
 		petOwners = {},
 		summonedPets = {},
+		petNameOwners = {},
+		unattributedPets = { count = 0 },
 		mobs = {},
 		diagnosticEnabled = context.scope == "dungeon" and diagnosticArmed,
 		diagnosticPendingStart = context.scope == "dungeon" and diagnosticArmed,
@@ -2394,7 +2591,7 @@ local function MarkMobEngaged(guid)
 end
 
 -- Rolling two second window of damage taken. Once a tank has eaten more than
--- TANK_PRESSURE_HEALTH_FRACTION of their health pool inside that window they
+-- TUNING.TANK_PRESSURE_HEALTH_FRACTION of their health pool inside that window they
 -- are flagged as under pressure, and mitigation is accounted separately for
 -- the duration. That is what separates a tank who holds cooldowns for the
 -- dangerous moments from one who bleeds them on trash.
@@ -2413,20 +2610,30 @@ local function UpdateTakenWindow(stats, incoming, maximumHealth, now)
 	local windowTotal = SafeNumber(stats.previousSecondTaken)
 		+ stats.currentSecondTaken
 	if maximumHealth > 0
-		and windowTotal >= maximumHealth * TANK_PRESSURE_HEALTH_FRACTION
+		and windowTotal >= maximumHealth * TUNING.TANK_PRESSURE_HEALTH_FRACTION
 	then
-		stats.underPressureUntil = now + TANK_PRESSURE_WINDOW
+		stats.underPressureUntil = now + TUNING.TANK_PRESSURE_WINDOW
 		session.anyPressureUntil = stats.underPressureUntil
 	end
 	return stats.underPressureUntil ~= nil and now <= stats.underPressureUntil
 end
 
-local function RecordDamage(sourceGUID, destGUID, amount, absorbed, resisted, blocked, spellId)
+local function RecordDamage(
+	sourceGUID, destGUID, amount, absorbed, resisted, blocked, spellId,
+	sourceFlags, sourceName
+)
 	if not session or amount <= 0 then
 		return
 	end
-	local sourceOwner = GetOwnerGUID(sourceGUID)
+	local sourceOwner = GetOwnerGUID(sourceGUID, sourceFlags, sourceName)
 	local destOwner = GetOwnerGUID(destGUID)
+	if not sourceOwner and sourceName and IsGroupPetFlags(sourceFlags) then
+		local unattributed = session.unattributedPets
+		if unattributed and unattributed[sourceName] then
+			unattributed[sourceName] = unattributed[sourceName] + amount
+				+ math.max(0, SafeNumber(absorbed))
+		end
+	end
 	if sourceOwner and not destOwner then
 		MarkMobEngaged(destGUID)
 	elseif destOwner and not sourceOwner then
@@ -2544,30 +2751,70 @@ end
 -- 34% is worth almost nothing; a large heal on someone at 8% is worth a full
 -- point. Self-heals are tracked but never rewarded, because surviving your own
 -- mistake is not the same as saving someone else.
+-- How close the group is to wiping right now. Only evaluated on the rare path
+-- where a heal has already qualified as clutch, so it costs nothing during
+-- normal healing. Health comes from the twice-a-second sampler, not the API.
+local function GetGroupPeril()
+	local present, dead, critical = 0, 0, 0
+	for guid, member in pairs(session and session.roster or {}) do
+		if member.present then
+			present = present + 1
+			local isDead = member.unit
+				and type(UnitIsDeadOrGhost) == "function"
+				and IsValidRosterUnit(guid, member)
+				and UnitIsDeadOrGhost(member.unit)
+			if isDead then
+				dead = dead + 1
+			else
+				local pct = tonumber(member.lastHealthPct)
+				if pct and pct <= TUNING.WIPE_PERIL_CRITICAL_PCT then
+					critical = critical + 1
+				end
+			end
+		end
+	end
+	if present <= 1 then
+		return false, 0, 0, present
+	end
+	local living = math.max(1, present - dead)
+	local lowFraction = critical / living
+	-- Either somebody is already down, or half the group left standing is
+	-- critical. Both mean the next death likely cascades.
+	local perilous = (dead >= 1 and (critical > 0 or dead >= 2))
+		or lowFraction >= TUNING.WIPE_PERIL_MIN_LOW_FRACTION
+	return perilous, dead, critical, present
+end
+
 local function RecordClutchHeal(sourceOwner, destOwner, effective, restored)
 	if not session or effective <= 0 then
 		return
 	end
 	local beforePct, maximum = GetClutchHealthFraction(destOwner, restored)
-	if not beforePct or beforePct > CLUTCH_HEALTH_THRESHOLD then
+	if not beforePct or beforePct > TUNING.CLUTCH_HEALTH_THRESHOLD then
 		return
 	end
 	local healFraction = effective / maximum
-	if healFraction < CLUTCH_MIN_HEAL_FRACTION then
+	if healFraction < TUNING.CLUTCH_MIN_HEAL_FRACTION then
 		return
 	end
 
 	local severity = Clamp(
-		(CLUTCH_HEALTH_THRESHOLD - beforePct) / CLUTCH_HEALTH_THRESHOLD,
+		(TUNING.CLUTCH_HEALTH_THRESHOLD - beforePct) / TUNING.CLUTCH_HEALTH_THRESHOLD,
 		0,
 		1
 	)
-	local magnitude = Clamp(healFraction / CLUTCH_FULL_CREDIT_FRACTION, 0, 1)
+	local magnitude = Clamp(healFraction / TUNING.CLUTCH_FULL_CREDIT_FRACTION, 0, 1)
 	local credit = Clamp(severity * magnitude, 0, 1)
 	local isSelf = sourceOwner == destOwner
-	local isLifeSave = beforePct <= LIFESAVE_HEALTH_THRESHOLD
-		and healFraction >= LIFESAVE_MIN_HEAL_FRACTION
+	local isLifeSave = beforePct <= TUNING.LIFESAVE_HEALTH_THRESHOLD
+		and healFraction >= TUNING.LIFESAVE_MIN_HEAL_FRACTION
 	local targetRole = GetRole(session.roster[destOwner])
+	local perilous, deadCount, criticalCount = GetGroupPeril()
+	local savedKeyRole = TUNING.WIPE_SAVE_KEY_ROLES[targetRole] and true or false
+	local isWipeSave = isLifeSave and not isSelf and (perilous or savedKeyRole)
+	if isWipeSave then
+		credit = credit * TUNING.WIPE_SAVE_CREDIT_MULTIPLIER
+	end
 
 	ForSamples(function(sample)
 		local sourceStats = GetSampleStats(sample, sourceOwner)
@@ -2584,6 +2831,11 @@ local function RecordClutchHeal(sourceOwner, destOwner, effective, restored)
 				if isLifeSave then
 					sourceStats.lifeSaves = SafeNumber(sourceStats.lifeSaves) + 1
 				end
+				if isWipeSave then
+					sourceStats.wipeSaves = SafeNumber(sourceStats.wipeSaves) + 1
+					sourceStats.wipeSaveCredit =
+						SafeNumber(sourceStats.wipeSaveCredit) + credit
+				end
 				if targetRole == "TANK" then
 					sourceStats.clutchHealsOnTank =
 						SafeNumber(sourceStats.clutchHealsOnTank) + 1
@@ -2598,6 +2850,56 @@ local function RecordClutchHeal(sourceOwner, destOwner, effective, restored)
 			if destStats then
 				destStats.clutchRescuedBy =
 					SafeNumber(destStats.clutchRescuedBy) + 1
+			end
+		end
+	end)
+end
+
+-- Counts how many distinct group members one non-healer covered inside a
+-- rolling window. Only evaluated for sources that are not healers, so a
+-- dedicated healer doing its job never trips it.
+local function RecordPartyWideHealing(sourceOwner, destOwner, now)
+	if sourceOwner == destOwner then
+		return
+	end
+	local sourceMember = session.roster[sourceOwner]
+	if not sourceMember or GetRole(sourceMember) == "HEALER" then
+		return
+	end
+	local groupSize = math.max(
+		SafeNumber(session.currentGroupSize),
+		SafeNumber(session.peakGroupSize),
+		2
+	)
+	ForSamples(function(sample)
+		local stats = GetSampleStats(sample, sourceOwner)
+		if not stats then
+			return
+		end
+		local window = stats.partyWideWindow
+		if not window or now - SafeNumber(stats.partyWideStartedAt)
+			> TUNING.PARTY_WIDE_HEAL_WINDOW
+		then
+			window = {}
+			stats.partyWideWindow = window
+			stats.partyWideStartedAt = now
+			stats.partyWideCredited = nil
+		end
+		if not window[destOwner] then
+			window[destOwner] = true
+			local covered = 0
+			for _ in pairs(window) do
+				covered = covered + 1
+			end
+			stats.partyWideBestCount = math.max(
+				SafeNumber(stats.partyWideBestCount), covered
+			)
+			if not stats.partyWideCredited
+				and covered / groupSize > TUNING.PARTY_WIDE_MIN_FRACTION
+			then
+				stats.partyWideCredited = true
+				stats.partyWideSaves = SafeNumber(stats.partyWideSaves) + 1
+				stats.wipeSaves = SafeNumber(stats.wipeSaves) + 1
 			end
 		end
 	end)
@@ -2642,6 +2944,9 @@ local function RecordHealing(sourceGUID, destGUID, amount, overhealing)
 		end
 	end)
 	RecordClutchHeal(sourceOwner, destOwner, effective, effective)
+	if effective > 0 then
+		RecordPartyWideHealing(sourceOwner, destOwner, GetTime())
+	end
 end
 
 local function RecordAbsorb(destGUID, absorberGUID, amount)
@@ -2694,6 +2999,52 @@ local AVOIDED_MISS_TYPES = {
 	IMMUNE = true,
 	DEFLECT = true,
 }
+-- A heal that lands on someone at or below this fraction of maximum health is
+-- treated as a clutch heal: without it the target was on a credible path to
+-- dying. The deeper the target had fallen and the larger the heal relative to
+-- their health pool, the more credit the healer receives.
+
+-- A healer who also contributes damage is rewarded, but only once their actual
+-- healing duties are demonstrably met. The gate is zero if anyone died a
+-- preventable death, so damage can never be traded against healing.
+
+-- Mitigation is measured from what the combat log actually proves: the
+-- resisted, blocked and absorbed portions of every hit the tank took, plus the
+-- swings they avoided outright. No spell list is required, so this works on a
+-- custom client whose defensive abilities are unknown to the addon.
+
+-- Pace. A dungeon is cleared in wall-clock time, not in combat time, so the
+-- gaps between pulls matter as much as the pulls. Anything longer than this is
+-- treated as real downtime rather than the normal seconds between packs.
+
+-- A spell that lands on the same non-tank three or more times in one fight is
+-- the clearest signal the client can give that the damage was avoidable and
+-- the player did not move. Everything past the second hit is counted.
+
+-- Combat log object flags. The server tags a pet as a pet regardless of which
+-- class summoned it, which is the only attribution signal that survives a
+-- server renaming its classes or shipping new specs.
+
+-- Hybrid (dual role) grading. A hybrid is not expected to match a dedicated
+-- damage dealer, and cannot replace a healer at all, so both contributions are
+-- measured against their own role's reference and then summed against a par
+-- that sits below one full role.
+
+-- A damage/healer hybrid is expected to clearly out-damage the actual healers.
+-- Landing anywhere near healer-level damage means the hybrid is being played as
+-- a worse healer rather than as a damage dealer who also heals. Genuine
+-- outliers exist, so this scales the score down rather than disqualifying it.
+-- Some hybrids genuinely fill the healer slot. When they do, their damage is
+-- expected to be far lower and must not be penalised for it, so the grader has
+-- two modes and picks by what the player actually did this fight.
+
+-- Wipe prevention. A save landed while the group is already collapsing is worth
+-- far more than the same heal during a healthy pull, because it is the
+-- difference between a clear and a corpse run.
+
+-- Losing the tank or the healer cascades into a wipe on its own, so a save on
+-- either counts as wipe prevention regardless of how healthy the rest of the
+-- group looked at that instant.
 
 local function RecordAvoidance(destGUID, missType)
 	if not session or not session.inCombat then
@@ -2787,7 +3138,7 @@ RecordRepeatedHit = function(stats, spellId, amount)
 	end
 	local seen = hits[spellId]
 	if not seen then
-		if hits.count >= REPEAT_HIT_MAX_TRACKED_SPELLS then
+		if hits.count >= TUNING.REPEAT_HIT_MAX_TRACKED_SPELLS then
 			return
 		end
 		hits.count = hits.count + 1
@@ -2795,7 +3146,7 @@ RecordRepeatedHit = function(stats, spellId, amount)
 	end
 	seen = seen + 1
 	hits[spellId] = seen
-	if seen > REPEAT_HIT_FREE_HITS then
+	if seen > TUNING.REPEAT_HIT_FREE_HITS then
 		stats.repeatedHitDamage = SafeNumber(stats.repeatedHitDamage) + amount
 		stats.repeatedHitCount = SafeNumber(stats.repeatedHitCount) + 1
 	end
@@ -2944,16 +3295,18 @@ local function ParseCombatLog(...)
 		return
 	end
 	local timestamp, subevent, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11 = ...
-	local sourceGUID, sourceName, destGUID, destName, extraIndex
+	local sourceGUID, sourceName, sourceFlags, destGUID, destName, extraIndex
 	if type(arg3) == "boolean" then
 		sourceGUID = arg4
 		sourceName = arg5
+		sourceFlags = arg6
 		destGUID = arg8
 		destName = arg9
 		extraIndex = 12
 	else
 		sourceGUID = arg3
 		sourceName = arg4
+		sourceFlags = arg5
 		destGUID = arg6
 		destName = arg7
 		extraIndex = 9
@@ -2980,7 +3333,10 @@ local function ParseCombatLog(...)
 		local resisted = SafeNumber(select(extraIndex + 3, ...))
 		local blocked = SafeNumber(select(extraIndex + 4, ...))
 		local absorbed = SafeNumber(select(extraIndex + 5, ...))
-		RecordDamage(sourceGUID, destGUID, amount, absorbed, resisted, blocked)
+		RecordDamage(
+			sourceGUID, destGUID, amount, absorbed, resisted, blocked, nil,
+			sourceFlags, sourceName
+		)
 	elseif subevent == "SPELL_DAMAGE"
 		or subevent == "SPELL_PERIODIC_DAMAGE"
 		or subevent == "RANGE_DAMAGE"
@@ -2993,7 +3349,7 @@ local function ParseCombatLog(...)
 		local absorbed = SafeNumber(select(extraIndex + 8, ...))
 		RecordDamage(
 			sourceGUID, destGUID, amount, absorbed, resisted, blocked,
-			select(extraIndex, ...)
+			select(extraIndex, ...), sourceFlags, sourceName
 		)
 	elseif subevent == "ENVIRONMENTAL_DAMAGE" then
 		RecordDamage(sourceGUID, destGUID, SafeNumber(select(extraIndex + 1, ...)), 0)
@@ -3041,6 +3397,10 @@ local function ParseCombatLog(...)
 			session.petOwners[destGUID] = owner
 			session.summonedPets = session.summonedPets or {}
 			session.summonedPets[destGUID] = true
+			if destName then
+				session.petNameOwners = session.petNameOwners or {}
+				session.petNameOwners[destName] = owner
+			end
 		end
 	end
 end
@@ -3752,6 +4112,7 @@ local CURRENT_STAT_KEYS = {
 	"minHealthPct", "utilityActions", "combatObservedSeconds",
 	"clutchHeals", "clutchHealing", "clutchCredit", "lifeSaves",
 	"clutchHealsOnTank", "clutchHealsOnHealer", "clutchSelfHeals",
+	"wipeSaves", "wipeSaveCredit", "partyWideSaves", "partyWideBestCount",
 	"clutchRescuedBy", "threatLossEvents",
 	"damageTakenRaw", "damageMitigated", "pressureDamageTaken",
 	"pressureDamageMitigated", "pressureSeconds", "incomingAttacks",
@@ -3972,6 +4333,10 @@ BuildCurrentDungeonSnapshot = function(finished)
 				clutchHealsOnTank = SafeNumber(stats.clutchHealsOnTank),
 				clutchHealsOnHealer = SafeNumber(stats.clutchHealsOnHealer),
 				clutchSelfHeals = SafeNumber(stats.clutchSelfHeals),
+				wipeSaves = SafeNumber(stats.wipeSaves),
+				wipeSaveCredit = SafeNumber(stats.wipeSaveCredit),
+				partyWideSaves = SafeNumber(stats.partyWideSaves),
+				partyWideBestCount = SafeNumber(stats.partyWideBestCount),
 				clutchRescuedBy = SafeNumber(stats.clutchRescuedBy),
 			},
 		}
@@ -4202,6 +4567,11 @@ BuildCurrentDungeonSnapshot = function(finished)
 			"supports=" .. GetEffectiveRoleCount(supports, activeTime)
 		)
 		local reference = supportCategory and supportCategory.contexts[contextKey]
+		local hybridDamageReference, hybridHealReference,
+			hybridHealerDamageReference, hybridHealerPresent =
+			GetRoleReferenceRates(eligibleParticipants, activeTime)
+		local hybridHealLoadRate =
+			SafeNumber(sample.groupDamageTaken) / math.max(1, activeTime)
 		for _, participant in ipairs(supports) do
 			participant.measuredContribution = SafeNumber(participant.stats.damage)
 				+ participant.impact
@@ -4217,11 +4587,40 @@ BuildCurrentDungeonSnapshot = function(finished)
 			local utilityRate = SafeNumber(participant.stats.utilityActions)
 				/ math.max(activeTime / 60, 1)
 			local utility = Clamp(1 + utilityRate * 0.05, 1, 1.25)
+			local hybrid = GetHybridContribution(
+				participant.stats, activeTime,
+				hybridDamageReference, hybridHealReference,
+				hybridHealerDamageReference, hybridHealerPresent,
+				hybridHealLoadRate
+			)
 			local row = rowByGUID[participant.guid]
-			row.score = Clamp(100 * (
+			local contextScore = 100 * (
 				0.75 * contribution + 0.20 * aliveRate + 0.05 * utility
-			), 30, 200)
+			)
+			-- When both pure-role references exist the hybrid model is the more
+			-- meaningful measure; otherwise fall back to the historical
+			-- context comparison so a lone hybrid still receives a score.
+			row.score = Clamp(
+				hybrid.measurable
+					and (0.70 * hybrid.score + 0.30 * contextScore)
+					or contextScore,
+				30, 200
+			)
+			row.hybrid = hybrid
 			row.supportBreakdown = {
+				hybridScore = hybrid.score,
+				damageShare = hybrid.damageShare,
+				healShare = hybrid.healShare,
+				rawHealShare = hybrid.rawHealShare,
+				combined = hybrid.combined,
+				par = hybrid.par,
+				synergy = hybrid.synergy,
+				damageReference = hybrid.damageReference,
+				healReference = hybrid.healReference,
+				healerDamageReference = hybrid.healerDamageReference,
+				healerDamageMultiple = hybrid.healerDamageMultiple,
+				dpsGate = hybrid.dpsGate,
+				measurable = hybrid.measurable,
 				contribution = contribution,
 				contributionRate = contributionRate,
 				participation = participation,
@@ -4275,6 +4674,17 @@ BuildCurrentDungeonSnapshot = function(finished)
 		bossCount = SafeNumber(sample.bossCount),
 		wipes = SafeNumber(sample.wipes),
 		completionPath = sample.completionPath,
+		unattributedPets = (function()
+			local out, total = {}, 0
+			for name, amount in pairs(session.unattributedPets or {}) do
+				if name ~= "count" and SafeNumber(amount) > 0 then
+					out[#out + 1] = { name = name, damage = SafeNumber(amount) }
+					total = total + SafeNumber(amount)
+				end
+			end
+			table.sort(out, function(l, r) return l.damage > r.damage end)
+			return { sources = out, total = total }
+		end)(),
 		pace = {
 			elapsedSeconds = math.max(0, GetTime() - SafeNumber(session.startedAt)),
 			combatSeconds = activeTime,
@@ -4749,6 +5159,23 @@ PvE.InitializeDatabase = InitializeDatabase
 PvE.IsDamageRole = IsDamageRole
 
 -- The PvE panels are loaded from PvEUI.lua.
+
+-- Names the pets whose damage could not be attributed to an owner, so the
+-- affected specs come from your own log instead of guesswork.
+function PvE.PrintUnattributed()
+	local snapshot = PvE.GetCurrentDungeonSnapshot()
+	local report = snapshot and snapshot.unattributedPets
+	if not report or #report.sources == 0 then
+		Chat("no unattributed pet damage recorded")
+		return
+	end
+	Chat("unattributed pet damage: " .. tostring(math.floor(report.total)))
+	for index = 1, math.min(10, #report.sources) do
+		local entry = report.sources[index]
+		Chat("  " .. tostring(entry.name) .. " - "
+			.. tostring(math.floor(entry.damage)))
+	end
+end
 
 function PvE.PrintStatus()
 	if not session then

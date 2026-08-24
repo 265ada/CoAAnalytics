@@ -551,6 +551,26 @@ local function AddClutchLines(entry)
 		tostring(math.floor(SafeNumber(clutch.clutchHeals))),
 		0.72, 0.78, 0.86, 1, 1, 1
 	)
+	if SafeNumber(clutch.wipeSaves) > 0 then
+		GameTooltip:AddDoubleLine(
+			"Wipe-prevention saves",
+			tostring(math.floor(SafeNumber(clutch.wipeSaves))),
+			1, 0.82, 0.20, 0.18, 0.90, 0.45
+		)
+		if SafeNumber(clutch.partyWideSaves) > 0 then
+			GameTooltip:AddDoubleLine(
+				"Carried party-wide healing",
+				tostring(math.floor(SafeNumber(clutch.partyWideSaves))) .. "x ("
+					.. tostring(math.floor(SafeNumber(clutch.partyWideBestCount)))
+					.. " covered)",
+				1, 0.82, 0.20, 0.18, 0.90, 0.45
+			)
+		end
+		GameTooltip:AddLine(
+			"Saving the tank or healer, healing through a collapsing group, or covering most of the party as a non-healer. Weighted far above an ordinary save.",
+			0.58, 0.64, 0.72, true
+		)
+	end
 	if SafeNumber(clutch.lifeSaves) > 0 then
 		GameTooltip:AddDoubleLine(
 			"Likely life saves (under 20%)",
@@ -847,7 +867,48 @@ local function CreateSessionRow(parent, index)
 			GameTooltip:AddLine(" ")
 			GameTooltip:AddLine("Support breakdown", 1, 0.82, 0.20)
 			local breakdown = entry.supportBreakdown
-			if breakdown then
+			if breakdown and breakdown.measurable then
+				GameTooltip:AddLine(
+					"Graded as a hybrid: each contribution measured against that role's own reference.",
+					0.58, 0.64, 0.72, true
+				)
+				AddRatioLine("Damage vs. DPS reference", breakdown.damageShare)
+				AddRatioLine("Healing vs. healer reference", breakdown.rawHealShare)
+				if SafeNumber(breakdown.rawHealShare) > SafeNumber(breakdown.healShare) then
+					GameTooltip:AddLine(
+						string.format(
+							"Healing credit capped at %.0f%% of a dedicated healer; a hybrid cannot replace one.",
+							SafeNumber(breakdown.healShare) * 100
+						),
+						0.58, 0.64, 0.72, true
+					)
+				end
+				GameTooltip:AddDoubleLine(
+					"Combined vs. par",
+					string.format("%.2f / %.2f",
+						SafeNumber(breakdown.combined), SafeNumber(breakdown.par)),
+					0.72, 0.78, 0.86, 1, 1, 1
+				)
+				if breakdown.healerDamageMultiple then
+					local multiple = SafeNumber(breakdown.healerDamageMultiple)
+					GameTooltip:AddDoubleLine(
+						"Damage vs. the healers",
+						string.format("x%.2f", multiple),
+						0.72, 0.78, 0.86,
+						multiple >= 2 and 0.18 or 0.95,
+						multiple >= 2 and 0.82 or 0.62,
+						multiple >= 2 and 0.46 or 0.18
+					)
+					if SafeNumber(breakdown.dpsGate) < 1 then
+						GameTooltip:AddLine(
+							"Not clearly out-damaging the healers. A hybrid is a damage dealer that heals, not a second healer.",
+							0.95, 0.62, 0.18, true
+						)
+					end
+				end
+				AddBonusLine("Damage + healing synergy", breakdown.synergy)
+				AddRatioLine("Contribution vs. context", breakdown.contribution)
+			elseif breakdown then
 				AddRatioLine("Contribution vs. context", breakdown.contribution)
 				AddPercentLine("Time alive", breakdown.aliveRate)
 				GameTooltip:AddDoubleLine(

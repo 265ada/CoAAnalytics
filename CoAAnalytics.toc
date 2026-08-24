@@ -2,7 +2,7 @@
 ## Title: CoA Analytics
 ## Notes: Analyzes battleground, dungeon and raid performance, with real-time dungeon tracking.
 ## Author: OpenAI
-## Version: 2.15.0
+## Version: 2.16.0
 ## SavedVariables: CoAAnalyticsDB
 
 Namespace.lua

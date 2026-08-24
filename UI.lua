@@ -211,9 +211,31 @@ local function SetModernTabActive(button, active)
 	end
 end
 
+-- Conquest of Azeroth renamed several classes without changing their internal
+-- token, so the stored history and the game's own UI disagree. Without this the
+-- addon title-cases the raw token and shows "Sonofarugal" or "Monk" for classes
+-- the player knows as Bloodmage and Templar.
+local CLASS_TOKEN_DISPLAY_NAMES = {
+	SONOFARUGAL = "Bloodmage",
+	PROPHET = "Venomancer",
+	SPIRITMAGE = "Runemaster",
+	MONK = "Templar",
+	DEMONHUNTER = "Felsworn",
+	WILDWALKER = "Primalist",
+	KNIGHTOFXOROTH = "Knight of Xoroth",
+	WITCHDOCTOR = "Witch Doctor",
+	WITCHHUNTER = "Witch Hunter",
+	SUNCLERIC = "Sun Cleric",
+	FLESHWARDEN = "Fleshwarden",
+}
+
 local function GetRankingClassName(classToken)
 	if not classToken then
 		return "Unknown class"
+	end
+	local override = CLASS_TOKEN_DISPLAY_NAMES[string.upper(tostring(classToken))]
+	if override then
+		return override
 	end
 	local localized = LOCALIZED_CLASS_NAMES_MALE
 		and LOCALIZED_CLASS_NAMES_MALE[classToken]

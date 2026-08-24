@@ -1,5 +1,5 @@
 local ADDON_NAME = ...
-local ADDON_VERSION = CoAAnalyticsAddon and CoAAnalyticsAddon.VERSION or "2.15.0"
+local ADDON_VERSION = CoAAnalyticsAddon and CoAAnalyticsAddon.VERSION or "2.16.0"
 
 local ICON_SIZE = 18
 local ICON_OFFSET_Y = 3
@@ -1533,6 +1533,8 @@ SlashCmdList.COAANALYTICS = function(message)
 		CoAAnalyticsPvE.SetDungeonDiagnosticEnabled(false)
 	elseif message == "pve log clear" and CoAAnalyticsPvE then
 		CoAAnalyticsPvE.ClearDungeonDiagnostic()
+	elseif message == "pve pets" and CoAAnalyticsPvE then
+		CoAAnalyticsPvE.PrintUnattributed()
 	elseif message == "pve status" and CoAAnalyticsPvE then
 		CoAAnalyticsPvE.PrintStatus()
 	elseif message == "pve complete" and CoAAnalyticsPvE then
@@ -1569,7 +1571,7 @@ SlashCmdList.COAANALYTICS = function(message)
 				.. (state.pendingInspect and ", inspecting 1" or "")
 		)
 	else
-		Chat("/coaa settings | ranking | players | pve | performance | pve log on|off|status|clear | pve status | log | status | debug | retry")
+		Chat("/coaa settings | ranking | players | pve | performance | pve log on|off|status|clear | pve status | pve pets | log | status | debug | retry")
 	end
 end
 

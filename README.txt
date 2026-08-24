@@ -1,4 +1,4 @@
-CoA Analytics 2.15.0
+CoA Analytics 2.16.0
 ====================
 
 CoA Analytics analyzes specializations and roles on the CoA server. The addon
@@ -228,6 +228,53 @@ The per-player tooltip reports the number of repeat hits, the damage they cost,
 and what share of that character's total damage taken they represent. The
 tracker resets at the end of each pull and caps the number of distinct spells it
 follows per player, so it cannot grow without bound.
+
+Pet and guardian attribution
+----------------------------
+
+Damage from pets and guardians is attributed by reading the combat log's own
+object flags, so the addon never needs to know which of the 21 classes or 70
+specs summoned what. Ownership learned from any SPELL_SUMMON is also keyed by
+pet name, which recovers a guardian that was recast with a fresh GUID after a
+summon event was missed.
+
+Anything the flags prove is a group pet but that still cannot be traced to an
+owner is recorded rather than silently dropped. "/coaa pve pets" lists those
+sources by name and damage, so the specs actually affected come from your own
+log instead of guesswork.
+
+Hybrid grading
+--------------
+
+Specs that fill two roles are graded on a curve against both, because judging
+them purely as supports buried their real contribution.
+
+Which curve applies is decided by group composition, since that is what sets
+the expectation:
+
+- With a dedicated healer in the group, the hybrid is the secondary and is
+  expected to deal damage. Healing counts, but credit is capped at 60% of a
+  dedicated healer, because a hybrid cannot replace one.
+- With no healer at all, the hybrid is the healer. Its damage is expected to
+  be far lower and is never penalised for that. Healing is measured against the
+  healing the fight actually demanded rather than against a healer who is not
+  there.
+
+In damage mode a hybrid is also expected to clearly out-damage the actual
+healers; landing near healer-level damage scales the score down. That penalty
+fades out as the hybrid's own healing rises, so a spec doing two thirds of a
+real healer's work is never punished for it.
+
+Doing a full damage dealer's output while still healing meaningfully earns a
+synergy bonus. Genuine outliers are scaled, never disqualified.
+
+Wipe prevention
+---------------
+
+A life-saving heal counts as wipe prevention when it lands on the tank or the
+healer, when the group was already collapsing, or when a non-healer covers most
+of the party inside one window. All three mean the next death likely cascades,
+and all three are weighted far above an ordinary save.
 
 Scoring breakdowns
 ------------------
