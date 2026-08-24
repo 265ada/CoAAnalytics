@@ -1,0 +1,18 @@
+## Interface: 30300
+## Title: CoA Analytics
+## Notes: Analyzes battleground, dungeon and raid performance, with real-time dungeon tracking.
+## Author: OpenAI
+## Version: 2.15.0
+## SavedVariables: CoAAnalyticsDB
+
+Namespace.lua
+Core.lua
+BGRanking.lua
+Nameplates.lua
+PvE.lua
+PvEUI.lua
+DungeonOverlay.lua
+UI.lua
+Minimap.lua
+Scoreboard.lua
+BGTimer.lua
