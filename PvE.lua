@@ -389,18 +389,82 @@ local function GetMedianLevel(participants)
 	return levels[middle]
 end
 
+-- Details ships the launcher's own generated level-scaling table, which is the
+-- authoritative answer for how this server scales damage between levels. Using
+-- it is strictly better than the cautious curve below, which only ever existed
+-- because the addon had no access to the real numbers.
+--
+-- Details normalizes into the local player's level frame with
+-- scaled = amount * modifier / 100, so returning 100 / modifier lets the
+-- existing "divide by factor" call sites stay exactly as they are.
+local function GetDetailsLevelFactor(level)
+	local details = _G.Details
+	local scaling = details and details.LevelScaling
+	if not scaling
+		or scaling.enabled == false
+		or type(scaling.GetDamageModifier) ~= "function"
+	then
+		return
+	end
+	-- Details only applies this table where the server actually scales, so
+	-- respect the same gate. Scaling a context the server leaves alone would
+	-- invent a correction that does not exist.
+	if type(scaling.IsLevelScalingInstanceContext) == "function" then
+		local contextOk, inScaledContext =
+			pcall(scaling.IsLevelScalingInstanceContext, scaling)
+		if not contextOk or not inScaledContext then
+			return
+		end
+	end
+	level = tonumber(level)
+	local targetLevel = type(UnitLevel) == "function" and tonumber(UnitLevel("player"))
+	if not level or level <= 0 or not targetLevel or targetLevel <= 0 then
+		return
+	end
+	if level == targetLevel then
+		return 1
+	end
+	local success, modifier = pcall(
+		scaling.GetDamageModifier,
+		scaling,
+		level,
+		targetLevel,
+		"SPELL_DAMAGE",
+		nil,
+		nil,
+		nil,
+		0
+	)
+	modifier = success and tonumber(modifier)
+	if not modifier or modifier <= 0 then
+		return
+	end
+	-- Deliberately not clamped the way the fallback curve is. The whole point
+	-- of preferring this source is that it is the server's real scaling, so
+	-- narrowing it would reintroduce the inaccuracy it was brought in to fix.
+	local factor = 100 / modifier
+	if factor ~= factor or factor <= 0 or factor == math.huge then
+		return
+	end
+	return factor
+end
+
 local function GetLevelPowerFactor(participant, referenceLevel)
 	local level = GetParticipantLevel(participant)
+	local detailsFactor = GetDetailsLevelFactor(level)
+	if detailsFactor then
+		return detailsFactor, level, "details"
+	end
 	if not level or not referenceLevel or referenceLevel <= 0 then
-		return 1, level
+		return 1, level, "none"
 	end
 	local factor = (level / referenceLevel) ^ LEVEL_POWER_EXPONENT
-	return Clamp(factor, LEVEL_FACTOR_MIN, LEVEL_FACTOR_MAX), level
+	return Clamp(factor, LEVEL_FACTOR_MIN, LEVEL_FACTOR_MAX), level, "builtin"
 end
 
 local function GetLevelAdjustedValue(value, participant, referenceLevel)
-	local factor, level = GetLevelPowerFactor(participant, referenceLevel)
-	return SafeNumber(value) / factor, factor, level
+	local factor, level, source = GetLevelPowerFactor(participant, referenceLevel)
+	return SafeNumber(value) / factor, factor, level, source
 end
 
 local function NewStats(member)
@@ -1272,7 +1336,8 @@ local function AddDpsRanking(root, scope, sample, participants)
 			"trashObservedSeconds",
 			participation
 		)
-		participant.adjustedBossDamage, participant.levelFactor, participant.level =
+		participant.adjustedBossDamage, participant.levelFactor,
+			participant.level, participant.levelSource =
 			GetLevelAdjustedValue(
 				SafeNumber(participant.stats.bossDamage) / participant.bossParticipation,
 				participant,
@@ -1335,6 +1400,7 @@ local function AddDpsRanking(root, scope, sample, participants)
 			name = participant.member.name,
 			level = participant.level,
 			levelFactor = participant.levelFactor,
+			levelSource = participant.levelSource,
 			levelReference = levelReference,
 			participation = participation,
 			bossParticipation = participant.bossParticipation,
@@ -4366,7 +4432,8 @@ BuildCurrentDungeonSnapshot = function(finished)
 				GetPhaseParticipation(
 				participant, trashTime, "trashObservedSeconds", participation
 			)
-			participant.adjustedBossDamage, participant.levelFactor, participant.level =
+			participant.adjustedBossDamage, participant.levelFactor,
+				participant.level, participant.levelSource =
 				GetLevelAdjustedValue(
 					SafeNumber(participant.stats.bossDamage)
 						/ participant.bossParticipation,
@@ -4404,6 +4471,7 @@ BuildCurrentDungeonSnapshot = function(finished)
 				row.level = participant.level or row.level
 				row.levelReference = levelReference
 				row.levelFactor = participant.levelFactor
+				row.levelSource = participant.levelSource
 				local personalBossWeight = participant.bossParticipationRaw
 					and participant.bossParticipationRaw >= MIN_SCORING_PARTICIPATION
 					and bossWeight or 0
@@ -5188,6 +5256,25 @@ function PvE.PrintStatus()
 		if IsIdentityValid(GetMemberData(member)) then
 			identified = identified + 1
 		end
+	end
+	local scalingFactor = GetDetailsLevelFactor(
+		type(UnitLevel) == "function" and UnitLevel("player") or nil
+	)
+	local details = _G.Details
+	local scaling = details and details.LevelScaling
+	if not scaling then
+		Chat("level scaling: Details not loaded, using built-in curve")
+	elseif scaling.enabled == false then
+		Chat("level scaling: Details present but disabled, using built-in curve")
+	elseif not scalingFactor then
+		Chat("level scaling: Details loaded but returned no modifier"
+			.. " (table may be empty), using built-in curve")
+	else
+		local probe = GetDetailsLevelFactor(
+			math.max(1, (tonumber(UnitLevel("player")) or 80) - 10)
+		)
+		Chat("level scaling: using Details table"
+			.. " (10 levels below = x" .. string.format("%.3f", probe or 1) .. ")")
 	end
 	Chat(
 		tostring(session.context.instanceName)
